@@ -124,9 +124,9 @@ The described architecture and training strategy yielded the following results o
 
 | Metric       | Score                   | Analysis                                                                                  |
 | :----------- | :---------------------- | :---------------------------------------------------------------------------------------- |
-| **Accuracy** | **0.7871** (732/930)    | High accuracy confirms the efficacy of the "Accuracy-Aware Loss".                         |
-| **Spearman** | **0.6613**              | Strong correlation indicates the model learned the underlying ordinal plausibility scale. |
-| **p-Value**  | $5.05 \times 10^{-118}$ | Statistically significant result.                                                         |
+| **Accuracy** | **0.7957** (740/930)    | High accuracy confirms the efficacy of the "Accuracy-Aware Loss".                         |
+| **Spearman** | **0.6866**              | Strong correlation indicates the model learned the underlying ordinal plausibility scale. |
+| **p-Value**  | $1.23 \times 10^{-130}$ | Statistically significant result.                                                         |
 
 ## 7. Resources & References
 
