@@ -76,16 +76,21 @@ def is_within_standard_deviation(prediction, labels):
 
 def tag_sentence(sentence, homonym):
     """
-    Highlight the homonym in the sentence with asterisks for emphasis.
+    Highlight the homonym in the sentence with uppercase for emphasis.
+    Better than asterisks as it preserves tokenization integrity.
     """
     if not homonym or not sentence:
         return sentence
-    
+
     import re
+
     try:
-        # Wrap homonym with asterisks: *word*
+        # Convert homonym to uppercase while preserving case-insensitive matching
         tagged = re.sub(
-            f"({re.escape(homonym)})", r"*\1*", sentence, flags=re.IGNORECASE
+            f"\\b({re.escape(homonym)})\\b",
+            lambda m: m.group(1).upper(),
+            sentence,
+            flags=re.IGNORECASE,
         )
         return tagged
     except Exception:
@@ -391,7 +396,7 @@ TRAIN_EXAMPLES = []
 VAL_EXAMPLES = []
 EPOCHS = 10
 BATCH_SIZE = 6
-USE_UNCERTAINTY_WEIGHTING = False  # --use_uncertainty_weighting
+USE_UNCERTAINTY_WEIGHTING = True  # --use_uncertainty_weighting
 USE_ACCURACY_LOSS = False  # --use_accuracy_loss
 TEST_EXAMPLES = []
 HAS_OFFICIAL_TEST = False  # when official test.json is present (no labels)
@@ -423,8 +428,16 @@ def generate_predictions(
     show_progress: bool = True,
     clip_min: float = None,
     clip_max: float = None,
+    temperature: float = 1.0,
 ) -> list:
-    """Generate predictions for a list of examples."""
+    """Generate predictions for a list of examples.
+
+    Args:
+        temperature: Temperature scaling for logits.
+                     < 1.0 = more extreme predictions (wider range)
+                     > 1.0 = more conservative predictions (narrower range)
+                     = 1.0 = no scaling (default)
+    """
     model.eval()
     device = next(model.parameters()).device
 
@@ -453,6 +466,9 @@ def generate_predictions(
         with torch.no_grad():
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             logits = outputs.logits.squeeze(-1)
+
+            # Apply temperature scaling
+            logits = logits / temperature
 
             # First apply sigmoid to get [0, 1], then scale to [1, 5]
             preds = torch.sigmoid(logits) * LABEL_RANGE + LABEL_MIN
@@ -514,7 +530,6 @@ def create_trainer(
     max_steps=None,
     accuracy_loss_weight=0.0,
     accuracy_loss_temperature=10.0,
-    llrd_decay=0.9,
 ):
     """Create the trainer with the given hyperparameters.
 
@@ -527,90 +542,32 @@ def create_trainer(
                    for full training mode where we know the optimal duration.
         accuracy_loss_weight: Weight for the accuracy-aware loss (default 0.0 = disabled).
         accuracy_loss_temperature: Sharpness of the soft accuracy sigmoid (default 10.0).
-        llrd_decay: Multiplicative decay for layer-wise learning rate decay (Point 3).
     """
 
-    def get_optimizer_grouped_parameters(model, lr, weight_decay, decay_factor):
+    def get_optimizer_grouped_parameters(model, lr, weight_decay):
         """
-        Implementation of Layer-wise Learning Rate Decay (LLRD).
+        Grouped parameters for weight decay.
         """
         no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
-        # DeBERTa-v3 specifically has 'deberta' attribute
-        backbone = getattr(model, "deberta", model)
 
-        # 1. Regression head (highest LR)
         optimizer_grouped_parameters = [
             {
                 "params": [
                     p
                     for n, p in model.named_parameters()
-                    if "deberta" not in n and not any(nd in n for nd in no_decay)
+                    if not any(nd in n for nd in no_decay)
                 ],
                 "weight_decay": weight_decay,
-                "lr": lr,
             },
             {
                 "params": [
                     p
                     for n, p in model.named_parameters()
-                    if "deberta" not in n and any(nd in n for nd in no_decay)
+                    if any(nd in n for nd in no_decay)
                 ],
                 "weight_decay": 0.0,
-                "lr": lr,
             },
         ]
-
-        # 2. Encoder layers (decaying LR)
-        layers = backbone.encoder.layer
-        for i in range(23, -1, -1):
-            layer_lr = lr * (decay_factor ** (24 - i))
-            optimizer_grouped_parameters.extend(
-                [
-                    {
-                        "params": [
-                            p
-                            for n, p in layers[i].named_parameters()
-                            if not any(nd in n for nd in no_decay)
-                        ],
-                        "weight_decay": weight_decay,
-                        "lr": layer_lr,
-                    },
-                    {
-                        "params": [
-                            p
-                            for n, p in layers[i].named_parameters()
-                            if any(nd in n for nd in no_decay)
-                        ],
-                        "weight_decay": 0.0,
-                        "lr": layer_lr,
-                    },
-                ]
-            )
-
-        # 3. Embeddings (lowest LR)
-        embed_lr = lr * (decay_factor**25)
-        optimizer_grouped_parameters.extend(
-            [
-                {
-                    "params": [
-                        p
-                        for n, p in backbone.embeddings.named_parameters()
-                        if not any(nd in n for nd in no_decay)
-                    ],
-                    "weight_decay": weight_decay,
-                    "lr": embed_lr,
-                },
-                {
-                    "params": [
-                        p
-                        for n, p in backbone.embeddings.named_parameters()
-                        if any(nd in n for nd in no_decay)
-                    ],
-                    "weight_decay": 0.0,
-                    "lr": embed_lr,
-                },
-            ]
-        )
 
         return optimizer_grouped_parameters
 
@@ -652,8 +609,10 @@ def create_trainer(
         save_strategy="steps",
         save_steps=eval_steps,
         load_best_model_at_end=True,  # load best model for evaluation
-        fp16=torch.cuda.is_available(),
-        dataloader_num_workers=0,
+        fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
+        bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
+        # dataloader_num_workers=2,
+        # dataloader_pin_memory=True,
         report_to="none",
         seed=42,
         metric_for_best_model="acc_within_sd",
@@ -661,9 +620,9 @@ def create_trainer(
         optim="adafactor",
     )
 
-    # custom optimizer with LLRD with grouped parameters due to Adafactor
+    # Grouped parameters for weight decay
     grouped_params = get_optimizer_grouped_parameters(
-        model, learning_rate, weight_decay, llrd_decay
+        model, learning_rate, weight_decay
     )
 
     from transformers.optimization import Adafactor
@@ -701,7 +660,7 @@ def create_trainer(
         data_collator=data_collator,
         processing_class=tokenizer,
         compute_metrics=metrics_calc,
-        optimizers=(optimizer, None),  # pass custom optimizer for LLRD
+        optimizers=(optimizer, None),  # custom optimizer for weight decay grouping
         callbacks=callbacks if callbacks else None,
     )
 
@@ -744,10 +703,9 @@ def run_training(trainer):
 
 
 def objective(trial):
-    learning_rate = trial.suggest_float("learning_rate", 2e-6, 2e-5, log=True)
+    learning_rate = trial.suggest_float("learning_rate", 2e-6, 2e-4, log=True)
     weight_decay = trial.suggest_float("weight_decay", 0.05, 0.15, step=0.0001)
-    warmup_ratio = trial.suggest_float("warmup_ratio", 0.05, 0.18, step=0.0001)
-    llrd_decay = trial.suggest_float("llrd_decay", 0.85, 0.95, step=0.001)
+    warmup_ratio = trial.suggest_float("warmup_ratio", 0.01, 0.2, step=0.0001)
     truncation_side = "left"  # analysis showed LEFT truncation preserves critical info
     max_grad_norm = None  # rely on Adafactor's update clipping
 
@@ -808,7 +766,6 @@ def objective(trial):
         uncertainty_scale=uncertainty_scale,
         accuracy_loss_weight=accuracy_loss_weight,
         accuracy_loss_temperature=accuracy_loss_temperature,
-        llrd_decay=llrd_decay,
     )
 
     eval_results, training_info = run_training(trainer)
@@ -820,37 +777,48 @@ def objective(trial):
     if HAS_OFFICIAL_TEST and len(TEST_EXAMPLES) > 0:
         predictions_dir = "./trial_predictions"
         os.makedirs(predictions_dir, exist_ok=True)
-        predictions_file = os.path.join(
-            predictions_dir, f"predictions-{trial.number}.jsonl"
-        )
 
-        predictions = generate_predictions(
-            trainer.model,
-            tokenizer,
-            TEST_EXAMPLES,
-            truncation_side=truncation_side,
-            batch_size=BATCH_SIZE,
-            show_progress=False,
-            clip_min=pred_clip_min,
-            clip_max=pred_clip_max,
-        )
-        save_predictions_jsonl(predictions, predictions_file)
+        # predictions with multiple temperature values
+        temperatures = [1.0, 1.1, 0.98, 0.95]
 
-        # Also generate predictions for dev.json
-        dev_predictions_file = os.path.join(
-            predictions_dir, f"predictions-{trial.number}_dev.jsonl"
-        )
-        dev_predictions = generate_predictions(
-            trainer.model,
-            tokenizer,
-            VAL_EXAMPLES,
-            truncation_side=truncation_side,
-            batch_size=BATCH_SIZE,
-            show_progress=False,
-            clip_min=pred_clip_min,
-            clip_max=pred_clip_max,
-        )
-        save_predictions_jsonl(dev_predictions, dev_predictions_file)
+        for temp in temperatures:
+            temp_suffix = f"_temp{temp}" if temp != 1.0 else ""
+
+            # Test set predictions
+            predictions_file = os.path.join(
+                predictions_dir, f"predictions-{trial.number}{temp_suffix}.jsonl"
+            )
+            predictions = generate_predictions(
+                trainer.model,
+                tokenizer,
+                TEST_EXAMPLES,
+                truncation_side=truncation_side,
+                batch_size=BATCH_SIZE,
+                show_progress=False,
+                clip_min=pred_clip_min,
+                clip_max=pred_clip_max,
+                temperature=temp,
+            )
+            save_predictions_jsonl(predictions, predictions_file)
+
+            # Dev set predictions
+            dev_predictions_file = os.path.join(
+                predictions_dir, f"predictions-{trial.number}_dev{temp_suffix}.jsonl"
+            )
+            dev_predictions = generate_predictions(
+                trainer.model,
+                tokenizer,
+                VAL_EXAMPLES,
+                truncation_side=truncation_side,
+                batch_size=BATCH_SIZE,
+                show_progress=False,
+                clip_min=pred_clip_min,
+                clip_max=pred_clip_max,
+                temperature=temp,
+            )
+            save_predictions_jsonl(dev_predictions, dev_predictions_file)
+
+        print(f"  [Predictions] Generated for temperatures: {temperatures}")
 
     # cleanup
     del model, tokenizer, trainer
