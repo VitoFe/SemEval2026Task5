@@ -5,23 +5,25 @@ Using Optuna for hyperparameter optimization
 Optimizing for Accuracy within SD + Spearman combination.
 """
 
-import optuna
-import torch
-import numpy as np
 import argparse
+import json
 import os
 import shutil
-import json
 import statistics
+
+import numpy as np
+import optuna
 import requests
+import torch
+from torch.utils.data import Dataset
 from transformers import (
     AutoModelForSequenceClassification,
     DebertaV2Tokenizer,
-    TrainingArguments,
-    Trainer,
     EarlyStoppingCallback,
+    Trainer,
+    TrainingArguments,
 )
-from torch.utils.data import Dataset
+
 from common_utils import load_data
 
 
@@ -72,33 +74,56 @@ def is_within_standard_deviation(prediction, labels):
     return False
 
 
+def tag_sentence(sentence, homonym):
+    """
+    Highlight the homonym in the sentence with uppercase for emphasis.
+    Better than asterisks as it preserves tokenization integrity.
+    """
+    if not homonym or not sentence:
+        return sentence
+
+    import re
+
+    try:
+        # Convert homonym to uppercase while preserving case-insensitive matching
+        tagged = re.sub(
+            f"\\b({re.escape(homonym)})\\b",
+            lambda m: m.group(1).upper(),
+            sentence,
+            flags=re.IGNORECASE,
+        )
+        return tagged
+    except Exception:
+        return sentence
+
+
 def format_input_parts(example):
     """
-    Format input as (text, text_pair) tuple for tokenizer handling.
+    Format input as a single concatenated text string.
+    Format: {homonym}: {meaning} Example: {example} Story: {precontext} {sentence}[SEP]{ending}
     """
-    story_parts = []
-    if hasattr(example, "precontext") and example.precontext:
-        story_parts.append(example.precontext.strip())
-    if hasattr(example, "sentence") and example.sentence:
-        story_parts.append(example.sentence.strip())
-    if hasattr(example, "ending") and example.ending:
-        story_parts.append(example.ending.strip())
-    story_text = " ".join(story_parts)
-    target = ""
-    if hasattr(example, "homonym") and example.homonym:
-        target = example.homonym
-    meaning = ""
-    if hasattr(example, "judged_meaning") and example.judged_meaning:
-        meaning = example.judged_meaning
-    example_usage = ""
-    if hasattr(example, "example_sentence") and example.example_sentence:
-        example_usage = example.example_sentence
+    homonym = example.homonym if hasattr(example, "homonym") else ""
+    meaning = example.judged_meaning if hasattr(example, "judged_meaning") else ""
+    example_sentence = (
+        example.example_sentence if hasattr(example, "example_sentence") else ""
+    )
+    precontext = example.precontext if hasattr(example, "precontext") else ""
+    sentence = example.sentence if hasattr(example, "sentence") else ""
+    ending = example.ending if hasattr(example, "ending") else ""
 
-    target_text = f"{target}: {meaning}"
-    if example_usage:
-        target_text += f" (Example: {example_usage})"
+    # Tag the homonym in the sentence
+    tagged_sentence = tag_sentence(sentence, homonym)
 
-    return story_text, target_text
+    # Handle missing ending
+    if len(ending) > 0:
+        refined_ending = ending
+    else:
+        refined_ending = "No ending provided"
+
+    # Combine into single text (tokenizer will add [SEP] tokens automatically)
+    text = f"{homonym}: {meaning} Example: {example_sentence} Story: {precontext} {tagged_sentence} [SEP] {refined_ending}"
+
+    return text
 
 
 def semantic_group_split(examples, test_ratio=0.15, seed=42):
@@ -161,14 +186,13 @@ class PlausibilityDataset(Dataset):
     def __getitem__(self, idx):
         example = self.examples[idx]
 
-        text, text_pair = format_input_parts(example)
+        text = format_input_parts(example)
 
         original_truncation_side = self.tokenizer.truncation_side
         self.tokenizer.truncation_side = self.truncation_side
 
         encoding = self.tokenizer(
             text,
-            text_pair=text_pair,
             max_length=self.max_length,
             truncation=True,
             return_tensors="pt",
@@ -256,13 +280,27 @@ class MetricsCalculator:
                 if is_within_standard_deviation(pred, choices)
             )
             acc_within_sd = correct / len(predictions)
+
+            # Continuous score for smoother hp optimization
+            # average soft error where values within threshold are near 0
+            soft_acc_score = 0
+            for pred, choices in zip(predictions, self.current_choices):
+                avg = sum(choices) / len(choices)
+                stdev = statistics.stdev(choices) if len(choices) > 1 else 1.0
+                threshold = max(stdev, 1.0)
+                error = abs(pred - avg)
+                # Sigmoid-like reward: 1 if within threshold, decays outside
+                reward = 1.0 / (1.0 + np.exp(5.0 * (error - threshold)))
+                soft_acc_score += reward
+            eval_soft_acc = soft_acc_score / len(predictions)
         else:
-            # fallback if choices length doesn't match
             acc_within_sd = np.mean(np.abs(predictions - labels) < 1.0)
+            eval_soft_acc = acc_within_sd
 
         return {
             "spearman": spearman_corr,
             "acc_within_sd": acc_within_sd,
+            "soft_acc": eval_soft_acc,
         }
 
     def update_choices(self, new_examples):
@@ -358,7 +396,7 @@ TRAIN_EXAMPLES = []
 VAL_EXAMPLES = []
 EPOCHS = 10
 BATCH_SIZE = 6
-USE_UNCERTAINTY_WEIGHTING = False  # --use_uncertainty_weighting
+USE_UNCERTAINTY_WEIGHTING = True  # --use_uncertainty_weighting
 USE_ACCURACY_LOSS = False  # --use_accuracy_loss
 TEST_EXAMPLES = []
 HAS_OFFICIAL_TEST = False  # when official test.json is present (no labels)
@@ -390,8 +428,16 @@ def generate_predictions(
     show_progress: bool = True,
     clip_min: float = None,
     clip_max: float = None,
+    temperature: float = 1.0,
 ) -> list:
-    """Generate predictions for a list of examples."""
+    """Generate predictions for a list of examples.
+
+    Args:
+        temperature: Temperature scaling for logits.
+                     < 1.0 = more extreme predictions (wider range)
+                     > 1.0 = more conservative predictions (narrower range)
+                     = 1.0 = no scaling (default)
+    """
     model.eval()
     device = next(model.parameters()).device
 
@@ -403,14 +449,11 @@ def generate_predictions(
     for i in range(0, len(examples), batch_size):
         batch_examples = examples[i : i + batch_size]
 
-        input_parts = [format_input_parts(ex) for ex in batch_examples]
-        texts = [parts[0] for parts in input_parts]
-        text_pairs = [parts[1] for parts in input_parts]
+        texts = [format_input_parts(ex) for ex in batch_examples]
 
         tokenizer.truncation_side = truncation_side
         encodings = tokenizer(
             texts,
-            text_pair=text_pairs,
             max_length=MAX_LENGTH,
             truncation=True,
             padding=True,
@@ -423,6 +466,9 @@ def generate_predictions(
         with torch.no_grad():
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             logits = outputs.logits.squeeze(-1)
+
+            # Apply temperature scaling
+            logits = logits / temperature
 
             # First apply sigmoid to get [0, 1], then scale to [1, 5]
             preds = torch.sigmoid(logits) * LABEL_RANGE + LABEL_MIN
@@ -498,6 +544,33 @@ def create_trainer(
         accuracy_loss_temperature: Sharpness of the soft accuracy sigmoid (default 10.0).
     """
 
+    def get_optimizer_grouped_parameters(model, lr, weight_decay):
+        """
+        Grouped parameters for weight decay.
+        """
+        no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
+
+        optimizer_grouped_parameters = [
+            {
+                "params": [
+                    p
+                    for n, p in model.named_parameters()
+                    if not any(nd in n for nd in no_decay)
+                ],
+                "weight_decay": weight_decay,
+            },
+            {
+                "params": [
+                    p
+                    for n, p in model.named_parameters()
+                    if any(nd in n for nd in no_decay)
+                ],
+                "weight_decay": 0.0,
+            },
+        ]
+
+        return optimizer_grouped_parameters
+
     # evaluation frequency based on dataset size
     steps_per_epoch = max(1, len(train_dataset) // batch_size)
     eval_steps = max(steps_per_epoch // 2, 10)  # at least every 10 steps
@@ -536,14 +609,32 @@ def create_trainer(
         save_strategy="steps",
         save_steps=eval_steps,
         load_best_model_at_end=True,  # load best model for evaluation
-        fp16=torch.cuda.is_available(),
-        dataloader_num_workers=0,
+        fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
+        bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
+        # dataloader_num_workers=2,
+        # dataloader_pin_memory=True,
         report_to="none",
         seed=42,
         metric_for_best_model="acc_within_sd",
         greater_is_better=True,
-        # uses factored second moments (saves memory)
         optim="adafactor",
+    )
+
+    # Grouped parameters for weight decay
+    grouped_params = get_optimizer_grouped_parameters(
+        model, learning_rate, weight_decay
+    )
+
+    from transformers.optimization import Adafactor
+
+    optimizer = Adafactor(
+        grouped_params,
+        lr=learning_rate,
+        weight_decay=weight_decay,
+        scale_parameter=False,
+        relative_step=False,
+        warmup_init=False,
+        clip_threshold=1.0,
     )
 
     metrics_calc = MetricsCalculator(val_examples)
@@ -569,6 +660,7 @@ def create_trainer(
         data_collator=data_collator,
         processing_class=tokenizer,
         compute_metrics=metrics_calc,
+        optimizers=(optimizer, None),  # custom optimizer for weight decay grouping
         callbacks=callbacks if callbacks else None,
     )
 
@@ -611,9 +703,9 @@ def run_training(trainer):
 
 
 def objective(trial):
-    learning_rate = trial.suggest_float("learning_rate", 2e-6, 2e-5, log=True)
+    learning_rate = trial.suggest_float("learning_rate", 2e-6, 2e-4, log=True)
     weight_decay = trial.suggest_float("weight_decay", 0.05, 0.15, step=0.0001)
-    warmup_ratio = trial.suggest_float("warmup_ratio", 0.05, 0.18, step=0.0001)
+    warmup_ratio = trial.suggest_float("warmup_ratio", 0.01, 0.2, step=0.0001)
     truncation_side = "left"  # analysis showed LEFT truncation preserves critical info
     max_grad_norm = None  # rely on Adafactor's update clipping
 
@@ -680,25 +772,53 @@ def objective(trial):
 
     spearman = eval_results["eval_spearman"]
     accuracy = eval_results["eval_acc_within_sd"]
+    soft_accuracy = eval_results["eval_soft_acc"]
 
     if HAS_OFFICIAL_TEST and len(TEST_EXAMPLES) > 0:
         predictions_dir = "./trial_predictions"
         os.makedirs(predictions_dir, exist_ok=True)
-        predictions_file = os.path.join(
-            predictions_dir, f"predictions-{trial.number}.jsonl"
-        )
 
-        predictions = generate_predictions(
-            trainer.model,
-            tokenizer,
-            TEST_EXAMPLES,
-            truncation_side=truncation_side,
-            batch_size=BATCH_SIZE,
-            show_progress=False,
-            clip_min=pred_clip_min,
-            clip_max=pred_clip_max,
-        )
-        save_predictions_jsonl(predictions, predictions_file)
+        # predictions with multiple temperature values
+        temperatures = [1.0, 1.1, 0.98, 0.95]
+
+        for temp in temperatures:
+            temp_suffix = f"_temp{temp}" if temp != 1.0 else ""
+
+            # Test set predictions
+            predictions_file = os.path.join(
+                predictions_dir, f"predictions-{trial.number}{temp_suffix}.jsonl"
+            )
+            predictions = generate_predictions(
+                trainer.model,
+                tokenizer,
+                TEST_EXAMPLES,
+                truncation_side=truncation_side,
+                batch_size=BATCH_SIZE,
+                show_progress=False,
+                clip_min=pred_clip_min,
+                clip_max=pred_clip_max,
+                temperature=temp,
+            )
+            save_predictions_jsonl(predictions, predictions_file)
+
+            # Dev set predictions
+            dev_predictions_file = os.path.join(
+                predictions_dir, f"predictions-{trial.number}_dev{temp_suffix}.jsonl"
+            )
+            dev_predictions = generate_predictions(
+                trainer.model,
+                tokenizer,
+                VAL_EXAMPLES,
+                truncation_side=truncation_side,
+                batch_size=BATCH_SIZE,
+                show_progress=False,
+                clip_min=pred_clip_min,
+                clip_max=pred_clip_max,
+                temperature=temp,
+            )
+            save_predictions_jsonl(dev_predictions, dev_predictions_file)
+
+        print(f"  [Predictions] Generated for temperatures: {temperatures}")
 
     # cleanup
     del model, tokenizer, trainer
@@ -707,9 +827,11 @@ def objective(trial):
         shutil.rmtree(trial_output_dir)
 
     # combined score for optimization (weight accuracy higher, main leaderboard metric)
-    combined_score = 0.3 * spearman + 0.7 * accuracy
+    # use soft_accuracy for smoother optimization landscape
+    combined_score = 0.2 * spearman + 0.8 * soft_accuracy
     trial.set_user_attr("spearman", spearman)
     trial.set_user_attr("accuracy", accuracy)
+    trial.set_user_attr("soft_accuracy", soft_accuracy)
     trial.set_user_attr("use_uncertainty_weighting", USE_UNCERTAINTY_WEIGHTING)
     trial.set_user_attr("use_accuracy_loss", USE_ACCURACY_LOSS)
     trial.set_user_attr("pred_clip_min", pred_clip_min)

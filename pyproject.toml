@@ -1,0 +1,20 @@
+[project]
+name = "stuff"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=1.12.0",
+    "hf-xet>=1.2.0",
+    "numpy>=2.3.5",
+    "optuna>=4.6.0",
+    "optuna-dashboard>=0.20.0",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.16.3",
+    "sentencepiece>=0.2.1",
+    "torch>=2.9.1",
+    "tqdm>=4.67.1",
+    "transformers>=4.57.3",
+    "ydata-profiling>=4.18.1",
+]

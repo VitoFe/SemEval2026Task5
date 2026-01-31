@@ -30,16 +30,18 @@ We selected **`microsoft/deberta-v3-large`** (approximately 435M parameters) as 
 
 ### 3.2 Input Representation & Tokenization
 
-Correctly formatting the input is critical for transformer performance. We adopted a sequence-pair classification format:
+Correctly formatting the input is critical for transformer performance. We adopted a concise concatenation format:
 
-- **Input Schema:** `[CLS] <Story Context> [SEP] <Target Meaning> [SEP]`
-  - _Story Context:_ Concatenation of `precontext` + `sentence` + `ending`.
-  - _Target Meaning:_ Concatenation of `homonym` + `judged_meaning` + `(Example: <example_usage>)`.
-- **Inclusion of Example Usage:** We explicitly included the dictionary "example usage" in the input string. This provides the model with a semantic anchor (prototype theory), allowing it to compare the _target_ usage in the story against a _canonical_ usage example, which is essential for disambiguating polysemous words in context.
+- **Input Schema:** `{homonym}: {meaning} Example: {example} Story: {precontext} {sentence} [SEP] {ending}`
+  - The homonym in the sentence is highlighted with tags `[TAG]...[/TAG]` to emphasize the target term requiring disambiguation.
+  - All information is concatenated into a single sequence, eliminating the need for complex template structures.
+  - The `[SEP]` token separates the story context from the ending, marking the critical resolution point.
+- **Rationale:** This compact format provides all necessary information—the target meaning, a usage example, and the story context—in a straightforward manner that the model can efficiently process. The simplicity reduces tokenization overhead while maintaining semantic clarity.
+- **Homonym Highlighting:** By marking the homonym in the story context with `[TAG]...[/TAG]` tags, we emphasize the word requiring disambiguation, aiding the model's focus on the relevant term.
 - **Max Sequence Length:** We set `MAX_LENGTH = 140`.
   - _Analysis:_ An analysis of the training corpus revealed that the 99th percentile of token counts was 139. Setting the length to 140 covers >99% of examples without wasting memory on the standard 512 dimensions, significantly increasing training throughput. Using longer sequences would unnecessarily consume GPU memory and slow down training without benefiting the vast majority of examples.
 - **Truncation Strategy:** **Left Truncation**.
-  - _reasoning:_ The task requires judging if a specific _ending_ is plausible given a context. The most critical information is the _ending_ itself and the _target meaning_ (which appears in the second segment). Standard right-truncation would remove these critical elements in long contexts, potentially discarding the very information needed for accurate plausibility assessment. Left-truncation preserves the resolution point of the story while removing less relevant introductory content.
+  - _reasoning:_ The task requires judging if a specific _ending_ is plausible given a context. The most critical information is the _ending_ itself (appearing after `[SEP]`). Standard right-truncation would remove this critical element in long contexts, potentially discarding the very information needed for accurate plausibility assessment. Left-truncation preserves the resolution point of the story while removing less relevant introductory content.
 
 ### 3.3 Regression Head
 
@@ -78,10 +80,11 @@ The competition metric considers a prediction correct if $|y_{pred} - y_{true}| 
     (where $k$ is a temperature parameter controlling sharpness).
 - **Reasoning:** This auxiliary objective aligns the gradient descent direction directly with the specific, discontinuous success criteria of the competition. By approximating the step function with a sigmoid, we create a smooth loss landscape that penalizes predictions outside the acceptable range more heavily, encouraging the model to focus on achieving the exact accuracy threshold rather than minimizing absolute error. This is particularly important for the "within standard deviation" metric, where small improvements in precision can lead to significant accuracy gains.
 
-### 4.4 Optimizer: Adafactor
+### 4.4 Optimizer: Adafactor with Layer-wise Learning Rate Decay
 
-- **Choice:** **Adafactor** over AdamW.
-- **Reasoning:** AdamW requires maintaining two moment vectors per parameter, effectively tripling the memory footprint of the model weights. Adafactor approximates the second moment using rank-1 factorization, significantly reducing memory usage. This allowed us to fit `DeBERTa-v3-large` and a batch size of 6-8 on a 24GB card, whereas AdamW would have caused OOM errors.
+- **Choice:** **Adafactor** over AdamW, combined with **Layer-wise Learning Rate Decay (LLRD)**.
+- **Reasoning for Adafactor:** AdamW requires maintaining two moment vectors per parameter, effectively tripling the memory footprint of the model weights. Adafactor approximates the second moment using rank-1 factorization, significantly reducing memory usage. This allowed us to fit `DeBERTa-v3-large` and a batch size of 6-8 on a 24GB card, whereas AdamW would have caused OOM errors.
+- **Layer-wise Learning Rate Decay (LLRD):** We implemented LLRD to assign different learning rates to different layers of the model. Higher learning rates are used for the regression head and upper encoder layers, while lower rates are applied to lower layers and embeddings. This prevents catastrophic forgetting in the pre-trained backbone while allowing fine-tuning of task-specific components. The decay factor is tuned during hyperparameter optimization.
 
 ## 5. Evaluation & Optimization
 
@@ -89,11 +92,15 @@ The competition metric considers a prediction correct if $|y_{pred} - y_{true}| 
 
 We used Optuna to perform a Bayesian search over the hyperparameter space.
 
-- **Objective Function:** We optimized a weighted combination: `0.3 * Spearman + 0.7 * Accuracy`. We prioritized Accuracy heavily as it is the primary competition metric, but included Spearman to ensure the model learned the correct _ranking_ order of plausibility. The 70/30 split reflects the competition's emphasis on accuracy while maintaining correlation quality.
+- **Objective Function:** We optimized a weighted combination: `0.2 * Spearman + 0.8 * Soft Accuracy`. We prioritized Soft Accuracy heavily as it is the primary competition metric, but included Spearman to ensure the model learned the correct _ranking_ order of plausibility. Soft Accuracy is a differentiable approximation of the discrete accuracy metric, providing a smoother optimization landscape for gradient-based tuning. The 80/20 split reflects the competition's emphasis on accuracy while maintaining correlation quality.
 - **Search Space:**
   - `learning_rate`: Logarithmic range $[2\times10^{-6}, 2\times10^{-5}]$. Chosen to be conservative for large models, avoiding instability from too high learning rates.
+  - `weight_decay`: $[0.05, 0.15]$ for regularization.
+  - `warmup_ratio`: $[0.05, 0.18]$ for gradual learning rate increase.
+  - `llrd_decay`: $[0.85, 0.95]$ for layer-wise learning rate decay factor.
   - `uncertainty_scale`: $[1.5, 3.0]$ when enabled. This range allows aggressive down-weighting of uncertain examples without completely ignoring them.
   - `accuracy_loss_weight`: $[0.6, 1.0]$ when enabled. Higher weights ensure the accuracy-aware loss dominates when active.
+  - `accuracy_loss_temperature`: $[2.0, 12.0]$ when enabled. Controls the sharpness of the sigmoid approximation in the accuracy-aware loss.
   - `pred_clip_min/max`: Optimized clipping bounds when accuracy loss is enabled.
 
 ### 5.2 Training Configuration
@@ -130,7 +137,7 @@ The described architecture and training strategy yielded the following results o
 
 ## 7. Resources & References
 
-- **Codebase:** `optuna_training_large.py`
+- **Codebase:** `train.py`
 - **Data Repository:** `https://github.com/Janosch-Gehring/ambistory`
 - **Model Source:** HuggingFace Hub (`microsoft/deberta-v3-large`)
 
